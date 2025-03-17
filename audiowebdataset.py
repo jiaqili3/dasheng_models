@@ -44,7 +44,9 @@ def _seq_crop_audio(
     pad_last: bool = False,
     handler=None,
 ):
-    """WebDataset crop filter, yields sequential crops"""
+    """WebDataset crop filter, yields sequential crops
+        crop_length: in number of frames
+    """
     for sample in data:
         audio, *extra = sample
         audio, sr = audio
@@ -53,7 +55,7 @@ def _seq_crop_audio(
         if audio.abs().max() >= 0.99 and drop_clipped:
             continue
         if crop_length is not None:
-            crops = crop_or_pad_audio(audio.float(), crop_size=(crop_length * sr), pad_last=pad_last)
+            crops = crop_or_pad_audio(audio.float(), crop_size=(crop_length), pad_last=pad_last)
         else:
             crops = [audio.float()]
 
@@ -162,6 +164,51 @@ class BalancedDatasetSampler(wds.DataPipeline, wds.compat.FluidInterface):
                 except StopIteration:
                     break
 
+class MultiDatasetLoader:
+    def __init__(self, dataloaders, batch_size, weights=None):
+        self.dataloaders = dataloaders
+        self.iterators = None
+        self.batch_size = batch_size
+        self.weights = weights if weights is not None else [1.0] * len(dataloaders)
+        self.weights = np.array(self.weights) / sum(self.weights)
+        assert len(self.weights) == len(dataloaders), "Number of weights must match number of dataloaders"
+        
+    def __iter__(self):
+        self.iterators = [iter(dl) for dl in self.dataloaders]
+        while True:
+            try:
+                # For each item in the batch, randomly select a dataset
+                batch_samples = []
+                batch_sources = []  # Track source dataset indices
+                for _ in range(self.batch_size):
+                    loader_idx = np.random.choice(len(self.dataloaders), p=self.weights)
+                    try:
+                        sample = next(self.iterators[loader_idx])
+                        # WebDataset returns batched data, we need to unbatch it
+                        if isinstance(sample, (list, tuple)) and len(sample) > 0:
+                            sample = sample[0]
+                        elif isinstance(sample, dict):
+                            sample = sample['speech']
+                        batch_samples.append(sample)
+                        batch_sources.append(loader_idx)
+                    except StopIteration:
+                        self.iterators[loader_idx] = iter(self.dataloaders[loader_idx])
+                        sample = next(self.iterators[loader_idx])
+                        if isinstance(sample, (list, tuple)) and len(sample) > 0:
+                            sample = sample[0]
+                        batch_samples.append(sample)
+                        batch_sources.append(loader_idx)
+                
+                # Collate the mixed batch
+                collated = collate_with_lengths_wds(batch_samples, flatten=False)
+                # Add source indices to the output
+                collated['batch_sources'] = torch.tensor(batch_sources)
+                yield collated
+            except KeyboardInterrupt:
+                raise KeyboardInterrupt
+            except Exception as e:
+                logger.warning(f"Error in batch creation: {e}")
+                raise e
 
 def expand_with_brace(lists: Iterable[str] | str):
     import braceexpand
@@ -194,12 +241,14 @@ def pad(tensorlist: Sequence[torch.Tensor], padding_value: float = 0.0):
 
 
 def collate_with_lengths_wds(
-    samples: List[Iterable], combine_scalars: bool = True, flatten: bool = True, combine_tensors: bool = True
+    samples: List[Iterable], combine_scalars: bool = True, flatten: bool = True, combine_tensors: bool = True, 
+    target_sample_rate=16000,
 ):
     batched = list(zip(*samples))
     # result = []
     result = {}
     result['duration'] = 0
+    result['sample_rate'] = target_sample_rate
 
     # result['speech'] = pad(list(batched[0]))
     for i, bat in enumerate(batched):
@@ -232,7 +281,7 @@ def collate_with_lengths_wds(
 # Returns (single) dicts with (audio=audio_data, *extra ), useful for only reading audio and keeping other items the same
 def create_rawaudio_webdataset(
     urls: List[str] | Dict[str, List[str]],
-    target_sample_rate: Optional[int] = None,
+    target_sample_rate: Optional[int] = 16000,
     mono: bool = True,
     num_workers: int = 4,
     batch_size: int = 64,
@@ -255,10 +304,9 @@ def create_rawaudio_webdataset(
     dataloader = wds.WebLoader(dataset, num_workers=min(len(urls), num_workers), batch_size=None).unbatched()
     dataloader = dataloader.batched(
         batch_size,
-        collation_fn=partial(collate_with_lengths_wds, flatten=False),
+        collation_fn=partial(collate_with_lengths_wds, flatten=False, target_sample_rate=target_sample_rate),
     )
     return dataloader
-
 
 def create_embedding_webdataset(
     urls: Union[List[str], Dict[str, List[str]]],
@@ -383,6 +431,7 @@ if __name__ == '__main__':
         batch_size=4,
         target_sample_rate=16000,
         num_workers=0,
+        crop_length=12345,
     )
     # ds = iter(ds)
     for data in ds:
