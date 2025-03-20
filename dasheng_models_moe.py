@@ -14,6 +14,19 @@ from itertools import repeat
 import collections
 import math
 
+def module_size(module: nn.Module, trainable_only: bool = False) -> int:
+    """
+    Calculate the total number of parameters in a PyTorch module.
+
+    Args:
+        module (nn.Module): The PyTorch module.
+        trainable_only (bool): If True, only count trainable parameters.
+
+    Returns:
+        int: Total number of parameters in the module.
+    """
+    return sum(p.numel() for p in module.parameters() if not trainable_only or p.requires_grad)
+
 # %%
 def _ntuple(n):
 
@@ -207,6 +220,7 @@ class MoEGate(nn.Module):
                  norm_topk_prob,
                  hidden_size,
                  aux_loss_type='gaussian',
+                 dataset_expert_mapping=None,  # New parameter for DAMEX
                  ):
         super().__init__()
         self.top_k = num_experts_per_tok
@@ -225,19 +239,48 @@ class MoEGate(nn.Module):
                           act_layer=nn.GELU,
                           drop=0.0,
                           )
+        
+        # DAMEX parameters
+        self.dataset_expert_mapping = dataset_expert_mapping  # Dict mapping dataset_id -> expert_id
+        self.damex_loss_weight = aux_loss_alpha
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        import torch.nn.init  as init
+        import torch.nn.init as init
 
     def compute_load_balancing_loss(self, gating_probs):
         expert_probs_mean = torch.mean(gating_probs, dim=0)
         uniform_distribution = torch.full_like(expert_probs_mean, 1.0 / expert_probs_mean.size(0))
         load_balancing_loss = F.kl_div(expert_probs_mean.log(), uniform_distribution, reduction='batchmean')
         return load_balancing_loss
+    
+    def compute_damex_loss(self, gating_logits, dataset_ids):
+        """
+        Compute DAMEX loss to encourage dataset-specific expert routing
+        
+        Args:
+            gating_logits: Tensor of shape [bsz, n_experts] - router logits
+            dataset_ids: Tensor of shape [bsz] - dataset ID for each sample in batch
+            
+        Returns:
+            damex_loss: Dataset-aware MoE loss
+        """
+        if self.dataset_expert_mapping is None or dataset_ids is None:
+            raise NotImplementedError("Dataset expert mapping is not provided for DAMEX.")
+            
+        # Create target labels based on dataset_ids and mapping
+        target_experts = torch.zeros_like(dataset_ids)
+        for i, dataset_id in enumerate(dataset_ids):
+            dataset_id_item = dataset_id.item()
+            if dataset_id_item in self.dataset_expert_mapping:
+                target_experts[i] = self.dataset_expert_mapping[dataset_id_item]
+        
+        # Compute cross entropy loss between router logits and target experts
+        damex_loss = F.cross_entropy(gating_logits, target_experts.long())
+        return damex_loss
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, dataset_ids=None):
         bsz, seq_len, h = hidden_states.shape
         ### compute sequence representation by mean pooling
         seq_repr = hidden_states.mean(dim=1)  # (bsz, h)
@@ -252,6 +295,20 @@ class MoEGate(nn.Module):
                 noise = torch.randn_like(gating_logits) * 0.01
                 gating_logits = gating_logits + noise
 
+            # Add DAMEX loss if enabled
+            if self.aux_loss_type.find('damex') != -1:
+                if dataset_ids is None:
+                    raise ValueError("Dataset IDs are required for DAMEX loss.")
+                damex_loss = self.compute_damex_loss(gating_logits, dataset_ids)
+                aux_loss += damex_loss * self.damex_loss_weight
+
+                # force gating logits to gt
+                target_experts = torch.zeros_like(gating_logits)
+                for i, dataset_id in enumerate(dataset_ids):
+                    expert_id = self.dataset_expert_mapping[dataset_id.item()]
+                    target_experts[i, expert_id] = 1.0
+                gating_logits = target_experts * 100  # Large value to create sharp distribution
+
         ### select top-k experts for sequence
         if self.scoring_func == 'softmax':
             gating_probs = gating_logits.softmax(dim=-1) 
@@ -260,7 +317,6 @@ class MoEGate(nn.Module):
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         
         topk_weight = topk_weight.softmax(dim=-1)
-        # topk_idx: [b, k]
         
         # calculate loss
         if self.training:
@@ -268,34 +324,6 @@ class MoEGate(nn.Module):
                 load_balancing_loss = self.compute_load_balancing_loss(gating_logits.softmax(dim=-1))
                 aux_loss += load_balancing_loss * self.aux_loss_alpha
 
-
-
-        # ### norm gate to sum 1
-        # if self.top_k > 1 and self.norm_topk_prob:
-        #     denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-        #     topk_weight = topk_weight / denominator
-            
-        # # Expand sequence-level selection to token-level
-        # topk_idx = topk_idx.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.top_k)  # (bsz*seq_len, k)
-        # topk_weight = topk_weight.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.top_k)  # (bsz*seq_len, k)
-
-        # ### expert-level computation auxiliary loss
-        # if self.training and self.aux_loss_alpha > 0.0:
-        #     scores_for_aux = scores
-        #     aux_topk = self.top_k
-        #     topk_idx_for_aux_loss = topk_idx[:, :aux_topk]  # (bsz, k)
-        #     if self.seq_aux:
-        #         ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-        #         ce.scatter_add_(1, topk_idx_for_aux_loss, torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(seq_len * aux_topk / self.n_routed_experts)
-        #         aux_loss = (ce * scores_for_aux.mean(dim=1)).sum(dim=1).mean() * self.aux_loss_alpha
-        #     else:
-        #         mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts) # (bsz*seq_len*k, n_routed_experts)
-        #         ce = mask_ce.float().mean(0) # (n_routed_experts,)
-        #         Pi = scores_for_aux.mean(0)  # (n_routed_experts,)
-        #         fi = ce * self.n_routed_experts  # magnify?
-        #         aux_loss = (Pi * fi).sum() * self.aux_loss_alpha  # Maximize and balance the use of experts
-        # else:
-        #     aux_loss = None
         return topk_idx, topk_weight, aux_loss
 
 
@@ -336,6 +364,7 @@ class MoeBlock(nn.Module):
         n_shared_experts = 2,
         aux_loss_alpha=1,
         aux_loss_type='gaussian',
+        dataset_expert_mapping=None,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -349,10 +378,10 @@ class MoeBlock(nn.Module):
             dim, init_values=init_values) if init_values else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim,
-                       hidden_features=int(dim * mlp_ratio),
-                       act_layer=act_layer,
-                       drop=drop)
+        # self.mlp = Mlp(in_features=dim,
+        #                hidden_features=int(dim * mlp_ratio),
+        #                act_layer=act_layer,
+        #                drop=drop)
         self.ls2 = LayerScale(
             dim, init_values=init_values) if init_values else nn.Identity()
 
@@ -372,7 +401,8 @@ class MoeBlock(nn.Module):
                  seq_aux=True,
                  norm_topk_prob=True,
                  hidden_size=dim,
-                 aux_loss_type=aux_loss_type)
+                 aux_loss_type=aux_loss_type,
+                 dataset_expert_mapping=dataset_expert_mapping,)
 
         if n_shared_experts is not None:
             self.shared_experts = Mlp(in_features=dim,
@@ -380,13 +410,13 @@ class MoeBlock(nn.Module):
                        act_layer=act_layer,
                        drop=drop)
 
-    def forward(self, x):
+    def forward(self, x, dataset_ids=None):
         x = x + self.ls1(self.attn(self.norm1(x)))
         residual = x
         x = self.norm2(x)
         identity = x
         orig_shape = x.shape  # (bsz, seq_len, h)
-        topk_idx, topk_weight, aux_loss = self.gate(x)  # (bsz, k)
+        topk_idx, topk_weight, aux_loss = self.gate(x, dataset_ids)  # (bsz, k)
 
         # Process input through selected experts
         expert_outputs = []
@@ -518,6 +548,7 @@ class AudioTransformerMAE_Encoder(nn.Module):
                 n_shared_experts=kwargs.get('n_shared_experts', 4),
                 aux_loss_alpha=kwargs.get('aux_loss_alpha', 1),
                 aux_loss_type=kwargs.get('aux_loss_type', 'gaussian'),
+                dataset_expert_mapping=kwargs.get('dataset_expert_mapping', None),
             ) for _ in range(depth)
         ])
         self.norm = norm_layer(embed_dim)
@@ -613,7 +644,7 @@ class AudioTransformerMAE_Encoder(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward_features(self, x, mask_ratio):
+    def forward_features(self, x, mask_ratio, dataset_ids=None):
         x = self.patch_embed(x)
         b, c, f, t = x.shape
         x = x + self.time_pos_embed[:, :, :, :t]
@@ -626,7 +657,14 @@ class AudioTransformerMAE_Encoder(nn.Module):
             cls_token = cls_token + self.token_pos_embed[:, :]
             x = torch.cat((cls_token, x), dim=1)
         x = self.pos_drop(x)
-        x = self.blocks(x)
+        
+        # Pass dataset_ids through blocks if they're MoeBlocks
+        for block in self.blocks:
+            if isinstance(block, MoeBlock):
+                x = block(x, dataset_ids)
+            else:
+                x = block(x)
+
         x = self.norm(x)
         return x, mask, ids_restore
 
@@ -674,9 +712,9 @@ class AudioTransformerMAE_Encoder(nn.Module):
             X = self.init_bn(X)
         return X
 
-    def forward(self, x, mask_ratio: float = 0.75):
+    def forward(self, x, mask_ratio: float = 0.75, dataset_ids=None):
         x = self.forward_to_spec(x)
-        x, mask, restore_idxs = self.forward_features(x, mask_ratio=mask_ratio)
+        x, mask, restore_idxs = self.forward_features(x, mask_ratio=mask_ratio, dataset_ids=dataset_ids)
         return x, mask, restore_idxs
 
 
@@ -797,7 +835,8 @@ class AudioTransformerMAE(nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 mask_ratio: float = 0.75,
-                return_loss: bool = False):
+                return_loss: bool = False,
+                dataset_ids=None,):
         # Collect auxiliary losses during forward pass
         aux_losses = []
         
@@ -816,7 +855,7 @@ class AudioTransformerMAE(nn.Module):
                 hooks.append(block.register_forward_hook(collect_aux_loss))
 
         # Forward pass through encoder
-        latent, mask, restore_ids = self.encoder(x, mask_ratio=mask_ratio)
+        latent, mask, restore_ids = self.encoder(x, mask_ratio=mask_ratio, dataset_ids=dataset_ids)
         
         # Remove hooks
         for hook in hooks:
@@ -832,7 +871,7 @@ class AudioTransformerMAE(nn.Module):
         if return_loss:
             main_loss = self.loss_fn(pred, targets, mask)
             # Create a dictionary of auxiliary losses by block
-            aux_loss_dict = {f'block_{i}_loss': loss for i, loss in enumerate(aux_losses)}
+            aux_loss_dict = {f'block_{i}_aux_loss': loss for i, loss in enumerate(aux_losses)}
             # Add total auxiliary loss to the dictionary
             aux_loss_dict['total_aux_loss'] = sum(aux_losses) if aux_losses else torch.tensor(0.0, device=main_loss.device)
             return main_loss, aux_loss_dict
@@ -915,6 +954,72 @@ def dasheng_12B(**kwargs):
     decoder = AudioTransformerMAE_Decoder(**decoder_kwargs)
     return AudioTransformerMAE(encoder, decoder)
 
+def test_dasheng_base_damex():
+    dataset_expert_mapping = {
+        0: 0,  # Dataset 0 -> Expert 0
+        1: 1,  # Dataset 1 -> Expert 1
+        2: 2,  # Dataset 2 -> Expert 2
+    }
+    model = dasheng_base(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=3,    # Change number of routed experts
+        n_shared_experts=1,      # Change number of shared experts
+        mlp_ratio=2,
+        aux_loss_alpha=1,
+        aux_loss_type='damex',
+        dataset_expert_mapping=dataset_expert_mapping,
+    )
+    
+    def count_active_params(model, x):
+        active_params = {'total': 0}  # Use dict to modify in closure
+        expert_usage = []
+        
+        def hook_fn(module, input, output):
+            if isinstance(module, MoeBlock):
+                # Get selected expert indices
+                topk_idx = module.gate(input[0], input[1])[0]  # (bsz*seq_len, k)
+                used_experts = torch.unique(topk_idx).tolist()
+                expert_usage.append(used_experts)
+                
+                # Count parameters in used experts
+                expert_params = sum(sum(p.numel() for p in expert.parameters()) 
+                                  for i, expert in enumerate(module.experts) 
+                                  if i in used_experts)
+                # Add shared expert parameters
+                if module.n_shared_experts is not None:
+                    expert_params += sum(p.numel() for p in module.shared_experts.parameters())
+                # Add gate parameters
+                expert_params += sum(p.numel() for p in module.gate.parameters())
+                # add attention parameters
+                expert_params += sum(p.numel() for p in module.attn.parameters())
+                active_params['total'] += expert_params
+        # Register hooks
+        hooks = []
+        for module in model.modules():
+            if isinstance(module, MoeBlock):
+                hooks.append(module.register_forward_hook(hook_fn))
+        
+        # Forward pass
+        dataset_ids = torch.tensor([0, 0, 1, 1])  # Example dataset IDs
+        with torch.no_grad():
+            _ = model(x, mask_ratio=0.75, dataset_ids=dataset_ids)
+        
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+            
+        return active_params['total'], expert_usage
+    # Test input
+    x = torch.randn(4, 5472)
+    active_params, expert_usage = count_active_params(model, x)
+    
+    print(f"\nMoE Forward Pass Statistics:")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Active Parameters in Forward Pass: {active_params:,}")
+    print("\nExpert Usage per MoE Layer:")
+    for i, experts in enumerate(expert_usage):
+        print(f"Layer {i}: Used {len(experts)} experts (indices: {sorted(experts)})")
+
 
 def test_dasheng_base():
     model = dasheng_base(
@@ -946,8 +1051,9 @@ def test_dasheng_base():
                     expert_params += sum(p.numel() for p in module.shared_experts.parameters())
                 # Add gate parameters
                 expert_params += sum(p.numel() for p in module.gate.parameters())
+                # add attention parameters
+                expert_params += sum(p.numel() for p in module.attn.parameters())
                 active_params['total'] += expert_params
-        
         # Register hooks
         hooks = []
         for module in model.modules():
@@ -963,9 +1069,8 @@ def test_dasheng_base():
             hook.remove()
             
         return active_params['total'], expert_usage
-
     # Test input
-    x = torch.randn(5, 5472)
+    x = torch.randn(1, 5472)
     active_params, expert_usage = count_active_params(model, x)
     
     print(f"\nMoE Forward Pass Statistics:")
@@ -975,6 +1080,11 @@ def test_dasheng_base():
     for i, experts in enumerate(expert_usage):
         print(f"Layer {i}: Used {len(experts)} experts (indices: {sorted(experts)})")
 
-test_dasheng_base()
+test_dasheng_base_damex()
 
 
+# if __name__ == '__main__':
+#     model = dasheng_base(use_chroma=False)
+#     breakpoint()
+#     loss = model(torch.randn(1,16000), return_loss=True)
+#     print(loss)
