@@ -713,6 +713,36 @@ class AudioTransformerMAE(nn.Module):
     def patchify(self, x):
         return self.unfold(x.unsqueeze(1)).transpose(-2, -1)
 
+def dasheng_base_moe_1share_3router_2mlp(**kwargs):
+    from .dasheng_models_moe import dasheng_base as dasheng_moe
+    model = dasheng_moe(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=3,    # Change number of routed experts
+        n_shared_experts=1,      # Change number of shared experts
+        mlp_ratio=2,
+        aux_loss_alpha=1,
+        aux_loss_type='gaussian_load_balancing',
+        **kwargs,
+    )
+    return model
+def dasheng_base_moe_1share_3router_2mlp_damex(**kwargs):
+    dataset_expert_mapping = {
+        0: 0,  # Dataset 0 -> Expert 0
+        1: 1,  # Dataset 1 -> Expert 1
+        2: 2,  # Dataset 2 -> Expert 2
+    }
+    from .dasheng_models_moe import dasheng_base as dasheng_moe
+    model = dasheng_moe(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=3,    # Change number of routed experts
+        n_shared_experts=1,      # Change number of shared experts
+        mlp_ratio=2,
+        aux_loss_alpha=1,
+        aux_loss_type='damex',
+        dataset_expert_mapping=dataset_expert_mapping,
+        **kwargs,
+    )
+    return model
 
 def dasheng_base(**kwargs):
     encoder_kwargs = dict(embed_dim=768,
@@ -787,6 +817,7 @@ def dasheng_12B(**kwargs):
     return AudioTransformerMAE(encoder, decoder)
 
 if __name__ == '__main__':
-    model = dasheng_base(use_chroma=True)
+    model = dasheng_base(use_chroma=False)
+    breakpoint()
     loss = model(torch.randn(1,16000), return_loss=True)
     print(loss)
