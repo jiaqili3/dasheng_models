@@ -14,6 +14,8 @@ from itertools import repeat
 import collections
 import math
 
+FORCE_GATING_TO_GT = False
+
 def module_size(module: nn.Module, trainable_only: bool = False) -> int:
     """
     Calculate the total number of parameters in a PyTorch module.
@@ -244,6 +246,8 @@ class MoEGate(nn.Module):
         self.dataset_expert_mapping = dataset_expert_mapping  # Dict mapping dataset_id -> expert_id
         self.damex_loss_weight = aux_loss_alpha
 
+        self.gate_noise = 0.1
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -255,6 +259,26 @@ class MoEGate(nn.Module):
         load_balancing_loss = F.kl_div(expert_probs_mean.log(), uniform_distribution, reduction='batchmean')
         return load_balancing_loss
     
+    def compute_load_importance_loss(self, scores_wo_noise, topk_logits):
+        from torch.distributions import Normal
+        
+        # Importance loss calculation
+        Impi = scores_wo_noise.float().sum(0)  # Sum over batch dimension
+        l_imp = Impi.float().var() / (Impi.float().mean() ** 2 + 1e-10)
+        
+        # Load loss calculation
+        normal = Normal(
+            torch.tensor([0.0], device=scores_wo_noise.device),
+            torch.tensor([self.gate_noise / self.n_routed_experts], device=scores_wo_noise.device),
+        )
+        threshold = topk_logits[:, -1].view(-1, 1).float()
+        diff = scores_wo_noise.float() - threshold.float()
+        prob = normal.cdf(diff)
+        Load = prob.sum(0)
+        l_load = Load.float().var() / (Load.float().mean() ** 2 + 1e-10)
+        
+        return (l_imp + l_load) / 2.0
+
     def compute_damex_loss(self, gating_logits, dataset_ids):
         """
         Compute DAMEX loss to encourage dataset-specific expert routing
@@ -303,11 +327,12 @@ class MoEGate(nn.Module):
                 aux_loss += damex_loss * self.damex_loss_weight
 
                 # force gating logits to gt
-                target_experts = torch.zeros_like(gating_logits)
-                for i, dataset_id in enumerate(dataset_ids):
-                    expert_id = self.dataset_expert_mapping[dataset_id.item()]
-                    target_experts[i, expert_id] = 1.0
-                gating_logits = target_experts * 100  # Large value to create sharp distribution
+                if FORCE_GATING_TO_GT:
+                    target_experts = torch.zeros_like(gating_logits)
+                    for i, dataset_id in enumerate(dataset_ids):
+                        expert_id = self.dataset_expert_mapping[dataset_id.item()]
+                        target_experts[i, expert_id] = 1.0
+                    gating_logits = target_experts * 100  # Large value to create sharp distribution
 
         ### select top-k experts for sequence
         if self.scoring_func == 'softmax':
@@ -323,7 +348,9 @@ class MoEGate(nn.Module):
             if self.aux_loss_type.find('load_balancing') != -1:
                 load_balancing_loss = self.compute_load_balancing_loss(gating_logits.softmax(dim=-1))
                 aux_loss += load_balancing_loss * self.aux_loss_alpha
-
+            if self.aux_loss_type.find('load_importance')!= -1:
+                load_importance_loss = self.compute_load_importance_loss(gating_logits, gating_logits.topk(self.top_k, dim=-1).values)
+                aux_loss += load_importance_loss * self.aux_loss_alpha
         return topk_idx, topk_weight, aux_loss
 
 
@@ -451,6 +478,49 @@ class MoeBlock(nn.Module):
         
         return y, aux_loss
 
+class CustomBlockWithFSQ(nn.Module):
+    def __init__(self,
+                 blocks: nn.Sequential,
+                 emb_dim,
+                 where_fsq= None,
+                 fsq_levels=[8,5,5,5],
+                 dataset_independent_fsq=False,
+                 fsq_prob=0.5,
+                ):
+        super().__init__()
+        self.blocks = blocks
+        self.where_fsq = where_fsq
+        from vector_quantize_pytorch import FSQ
+        if isinstance(where_fsq, int):
+            self.where_fsq = [where_fsq]
+        if dataset_independent_fsq:
+            self.fsq_modules = nn.ModuleList([FSQ(levels=fsq_levels, dim=emb_dim) for _ in range(len(self.where_fsq) * 3)])
+        else:
+            self.fsq_modules = nn.ModuleList([FSQ(levels=fsq_levels, dim=emb_dim) for _ in range(len(self.where_fsq))])
+        self.dataset_independent_fsq = dataset_independent_fsq
+        self.fsq_prob = fsq_prob
+
+    def forward(self, x, dataset_ids=None):
+        # dataset_ids: [b,], 0 to 2
+        for i, block in enumerate(self.blocks):
+            if i in self.where_fsq and random.random() < self.fsq_prob:
+                if not self.dataset_independent_fsq:
+                    fsq_module = self.fsq_modules[self.where_fsq.index(i)]
+                    x, indices = fsq_module(x)
+                    x = fsq_module(x, indices)
+                else:
+                    # we need to pass through all 3 fsq modules, and mask out fsq results not in dataset_ids
+                    result = torch.zeros_like(x)
+                    for j in range(3):
+                        fsq_module = self.fsq_modules[self.where_fsq.index(i) + j * 3]
+                        x, indices = fsq_module(x)
+                        x = fsq_module(x, indices)
+                        if dataset_ids is not None:
+                            mask = (dataset_ids == j).unsqueeze(-1).unsqueeze(-1)
+                            result = result + x * mask
+                    x = result
+            x = block(x, dataset_ids)
+        return x
 
 class AudioTransformerMAE_Encoder(nn.Module):
 
@@ -1022,14 +1092,7 @@ def test_dasheng_base_damex():
 
 
 def test_dasheng_base():
-    model = dasheng_base(
-        num_experts_per_tok=1,  # Change number of experts per token
-        n_routed_experts=3,    # Change number of routed experts
-        n_shared_experts=1,      # Change number of shared experts
-        mlp_ratio=2,
-        aux_loss_alpha=1,
-        aux_loss_type='gaussian_load_balancing',
-    )
+    model = dasheng_base_moe_0share_6router_4mlp()
     
     def count_active_params(model, x):
         active_params = {'total': 0}  # Use dict to modify in closure
@@ -1080,7 +1143,50 @@ def test_dasheng_base():
     for i, experts in enumerate(expert_usage):
         print(f"Layer {i}: Used {len(experts)} experts (indices: {sorted(experts)})")
 
-test_dasheng_base_damex()
+def dasheng_base_moe_1share_3router_2mlp(**kwargs):
+    dasheng_moe = dasheng_base
+    model = dasheng_moe(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=3,    # Change number of routed experts
+        n_shared_experts=1,      # Change number of shared experts
+        mlp_ratio=2,
+        aux_loss_alpha=1,
+        aux_loss_type='load_importance',
+        **kwargs,
+    )
+    return model
+def dasheng_base_moe_0share_6router_4mlp(**kwargs):
+    dasheng_moe = dasheng_base
+    model = dasheng_moe(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=6,    # Change number of routed experts
+        n_shared_experts=0,      # Change number of shared experts
+        mlp_ratio=4,
+        aux_loss_alpha=1,
+        aux_loss_type='load_importance',
+        **kwargs,
+    )
+    return model
+def dasheng_base_moe_1share_3router_2mlp_damex(**kwargs):
+    dataset_expert_mapping = {
+        0: 0,  # Dataset 0 -> Expert 0
+        1: 1,  # Dataset 1 -> Expert 1
+        2: 2,  # Dataset 2 -> Expert 2
+    }
+    dasheng_moe = dasheng_base
+    model = dasheng_moe(
+        num_experts_per_tok=1,  # Change number of experts per token
+        n_routed_experts=3,    # Change number of routed experts
+        n_shared_experts=1,      # Change number of shared experts
+        mlp_ratio=2,
+        aux_loss_alpha=1,
+        aux_loss_type='damex',
+        dataset_expert_mapping=dataset_expert_mapping,
+        **kwargs,
+    )
+    return model
+
+test_dasheng_base()
 
 
 # if __name__ == '__main__':
