@@ -73,7 +73,7 @@ class Audiowebdataset(wds.DataPipeline):
         target_sample_rate: None | int = None,
         batch_size: None | int = None,
         filter_function: None | Callable = None,
-        rename_keys: Dict[str, str] = dict(audio="flac;mp3;sox;wav;m4a;ogg;wma;opus", filename="__key__"),
+        rename_keys: Dict[str, str] = dict(audio="flac;mp3;sox;wav;m4a;ogg;wma;", filename="__key__"),
         map_kwargs: None | Dict[str, Callable] = None,
         merge_function: (
             None | Callable
@@ -187,23 +187,42 @@ class MultiDatasetLoader:
                         # WebDataset returns batched data, we need to unbatch it
                         if isinstance(sample, (list, tuple)) and len(sample) > 0:
                             sample = sample[0]
+                            target_sample_rate = 16000
                         elif isinstance(sample, dict):
+                            target_sample_rate = sample['sample_rate']
                             sample = sample['speech']
+                        else:
+                            raise NotImplementedError
                         batch_samples.append(sample)
                         batch_sources.append(loader_idx)
                     except StopIteration:
+                        if loader_idx == 1:
+                            # 1 epoch of general audio
+                            raise StopIteration
+                        logger.info(f"re-running iteration: {loader_idx}")
                         self.iterators[loader_idx] = iter(self.dataloaders[loader_idx])
                         sample = next(self.iterators[loader_idx])
                         if isinstance(sample, (list, tuple)) and len(sample) > 0:
                             sample = sample[0]
                         batch_samples.append(sample)
                         batch_sources.append(loader_idx)
-                
+                    except Exception as e:
+                        logger.error(e)
+                        continue
+                if batch_samples == []:
+                    continue
                 # Collate the mixed batch
-                collated = collate_with_lengths_wds(batch_samples, flatten=False)
-                # Add source indices to the output
-                collated['batch_sources'] = torch.tensor(batch_sources)
-                yield collated
+                try:
+                    collated = collate_with_lengths_wds(batch_samples, flatten=False, target_sample_rate=target_sample_rate)
+                    # Add source indices to the output
+                    collated['batch_sources'] = torch.tensor(batch_sources)
+                    assert 'speech' in collated.keys()
+                    yield collated
+                except Exception as e:
+                    logger.error(f"Error in batch creation: {e}")
+                    logger.error(f"Error in batch creation: {batch_samples}")
+                    logger.error(f"Error in batch creation: {batch_sources}")
+                    continue
             except KeyboardInterrupt:
                 raise KeyboardInterrupt
             except Exception as e:
@@ -253,6 +272,7 @@ def collate_with_lengths_wds(
     # result['speech'] = pad(list(batched[0]))
     for i, bat in enumerate(batched):
         if isinstance(bat[0], (int, float)):
+            raise NotImplementedError
             if combine_scalars:
                 bat = np.array(list(bat))
         elif isinstance(bat[0], torch.Tensor):
@@ -269,6 +289,7 @@ def collate_with_lengths_wds(
             if combine_tensors:
                 bat = np.array(list(bat))
         else:
+            # nothing here
             bat = list(bat)
         # Do not flatten lists, i.e., some filenames
         # if flatten and not isinstance(b, list):
@@ -292,7 +313,7 @@ def create_rawaudio_webdataset(
 
     dataset_kwargs = dict(
         batch_size=batch_size,
-        rename_keys=(dict(audio="flac;mp3;sox;wav;m4a;ogg;wma;opus", filename="__key__")),
+        rename_keys=(dict(audio="flac;mp3;sox;wav;m4a;ogg;wma;audio.mp3;clip.mp3", filename="__key__")),
         target_sample_rate=target_sample_rate,
         merge_function=partial(
             _seq_crop_audio, crop_length=crop_length, mono=mono, drop_clipped=False, pad_last=pad_last
@@ -422,13 +443,16 @@ if __name__ == '__main__':
 
     ds = create_rawaudio_webdataset(
         [
-            '/gluster-ssd-tts/jiaqi_repos/audioset/data/*.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/audioset/data/*.tar',
             # '/gluster-ssd-tts/jiaqi_repos/vggsound/vggsound_00.tar',
-            # '/gluster-ssd-tts/jiaqi_repos/mtg-jamendo/data/train/*.tar',
-            # '/gluster-ssd-tts/jiaqi_repos/mtg-jamendo/data/val/*.tar',
-            # '/gluster-ssd-tts/jiaqi_repos/mtg-jamendo/data/train/mine.tar',
+            # '/ssd2/lijiaqi18/mtg-jamendo/data/val/processed/*.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/mtg-jamendo/val_data/*.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/free-music-archive/fma_large.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/vocalset/vocalset.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/million-song-dataset/108427d78e3941708dce02e0dcd293a2/*.tar',
+            # '/gluster-ssd-tts/jiaqi_repos/laion_audio_300M/*.tar',
         ],
-        batch_size=4,
+        batch_size=8,
         target_sample_rate=16000,
         num_workers=0,
         crop_length=12345,
@@ -436,5 +460,5 @@ if __name__ == '__main__':
     # ds = iter(ds)
     for data in ds:
         print(data) # [b, t]
-        break
+        # break
         
